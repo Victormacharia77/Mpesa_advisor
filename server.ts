@@ -9,8 +9,9 @@ import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { TransactionType, MpesaTransaction } from "./src/types.js";
-// @ts-ignore
-import pdf from "pdf-parse";
+import { createRequire } from "module";
+const customRequire = typeof require !== "undefined" ? require : createRequire(import.meta.url);
+const { PDFParse } = customRequire("pdf-parse");
 
 // Load environment variables
 dotenv.config();
@@ -38,10 +39,213 @@ function getAiClient(): GoogleGenAI | null {
   return aiClient;
 }
 
+// Dedicated line-by-line PDF statement parser for Safaricom statements
+function parseMpesaPdfText(text: string): MpesaTransaction[] {
+  const transactions: MpesaTransaction[] = [];
+  const seenIds = new Set<string>();
+  
+  // Clean text a bit to normalize characters
+  const normalizedText = text.replace(/\r/g, "");
+
+  // Match 10-character alphanumeric transaction IDs (Receipt No)
+  const idRegex = /\b([A-Z0-9]{10})\b/gi;
+  let match;
+  const matches: { id: string; index: number }[] = [];
+  
+  while ((match = idRegex.exec(normalizedText)) !== null) {
+    const id = match[1].toUpperCase();
+    
+    // Validate that it has at least one letter and one number to avoid pure numbers (dates, phone numbers)
+    if (/^[A-Z0-9]{10}$/.test(id) && /[A-Z]/.test(id) && /[0-9]/.test(id)) {
+      // Exclude common PDF header words that happen to be 10 characters
+      if (!["STATEMENT", "SAFARICOM", "TELEPHONE", "TRANSACTION", "PARTICULAR", "CUSTOMER", "DETAILED", "COMPLETED", "CONFIRMED"].includes(id)) {
+        matches.push({ id, index: match.index });
+      }
+    }
+  }
+
+  for (const item of matches) {
+    const { id, index } = item;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    // Extract a local context window around the transaction ID (e.g. 120 chars before and 180 chars after)
+    // This is 100% immune to line split and alignment issues from PDF text parsers
+    const startPos = Math.max(0, index - 120);
+    const endPos = Math.min(normalizedText.length, index + 180);
+    const context = normalizedText.substring(startPos, endPos);
+
+    // Parse decimal/monetary values within this transaction context window
+    const monetaryMatches = context.match(/(-?[\d,]+\.\d{2})/g);
+    let amount = 0;
+    let balance = 0;
+
+    if (monetaryMatches && monetaryMatches.length > 0) {
+      // In typical Safaricom statement rows, the final column is the running Balance
+      balance = parseFloat(monetaryMatches[monetaryMatches.length - 1].replace(/,/g, ""));
+
+      // Identify the transaction amount as the first non-zero monetary value in the row context
+      let foundAmount = false;
+      for (let d = 0; d < monetaryMatches.length - 1; d++) {
+        const val = parseFloat(monetaryMatches[d].replace(/,/g, ""));
+        if (val !== 0) {
+          amount = Math.abs(val);
+          foundAmount = true;
+          break;
+        }
+      }
+      if (!foundAmount) {
+        if (monetaryMatches.length >= 2) {
+          amount = Math.abs(parseFloat(monetaryMatches[monetaryMatches.length - 2].replace(/,/g, "")));
+        } else {
+          amount = Math.abs(balance);
+        }
+      }
+    } else {
+      // Fallback: look for integers if no decimals exist
+      const simpleNumbers = context.match(/\b\d+\b/g);
+      if (simpleNumbers && simpleNumbers.length > 0) {
+        amount = parseFloat(simpleNumbers[simpleNumbers.length - 1]);
+      }
+    }
+
+    // Extract date and time from the context
+    let dateTimeStr = new Date().toISOString();
+    const dateMatch = context.match(/(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)/) || 
+                      context.match(/(\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?)/) ||
+                      context.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}(?::\d{2})?)/);
+    if (dateMatch) {
+      try {
+        dateTimeStr = new Date(dateMatch[1].replace(/-/g, "/")).toISOString();
+      } catch (e) {
+        // keep fallback
+      }
+    }
+
+    // Extract transaction detail/party text by cleaning out numbers, IDs, and metadata from context
+    let cleanText = context
+      .replace(id, "")
+      .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?/, "")
+      .replace(/\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?/, "")
+      .replace(/\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}(?::\d{2})?/, "")
+      .replace(/-?[\d,]+\.\d{2}/g, "")
+      .replace(/\bCompleted\b/g, "")
+      .replace(/\bSuccess\b/g, "")
+      .replace(/\bcompleted\b/g, "")
+      .replace(/\n/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    let party = cleanText || "M-Pesa Transaction";
+    let type = TransactionType.UNKNOWN;
+    let category = "Miscellaneous";
+
+    // Classify transactions and extract precise party names based on M-Pesa standard SMS/statement formatting
+    const contextLower = context.toLowerCase();
+
+    if (contextLower.includes("customer transfer to") || contextLower.includes("sent to") || contextLower.includes("mobile money transfer")) {
+      type = TransactionType.SEND_MONEY;
+      category = "Shopping";
+      const match = cleanText.match(/(?:sent to|transfer to)\s+([^0-9]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("received from") || contextLower.includes("customer transfer received") || contextLower.includes("funds received")) {
+      type = TransactionType.RECEIVE_MONEY;
+      category = "Income";
+      const match = cleanText.match(/(?:received from|transfer received from)\s+([^0-9]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("pay bill to") || contextLower.includes("paid to") || contextLower.includes("paybill")) {
+      type = TransactionType.PAY_BILL;
+      category = "Utilities";
+      const match = cleanText.match(/(?:pay bill to|paid to)\s+([^0-9.]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("merchant payment") || contextLower.includes("lipa na m-pesa") || contextLower.includes("buy goods")) {
+      type = TransactionType.BUY_GOODS;
+      category = "Shopping";
+      const match = cleanText.match(/(?:payment to|goods to|paid to)\s+([^0-9.]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("withdrawal") || contextLower.includes("withdrawn")) {
+      type = TransactionType.CASH_WITHDRAWAL;
+      category = "Miscellaneous";
+      const match = cleanText.match(/(?:at agent|from agent)\s+([^0-9]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("deposit")) {
+      type = TransactionType.CASH_DEPOSIT;
+      category = "Income";
+      const match = cleanText.match(/(?:at agent|from agent)\s+([^0-9]+)/i);
+      if (match) party = match[1].trim();
+    } else if (contextLower.includes("airtime")) {
+      type = TransactionType.AIRTIME;
+      party = "Safaricom Airtime";
+      category = "Utilities";
+    }
+
+    // Final string cleanups
+    party = party.replace(/\s+\d+$/, "").replace(/^[-\s:|]+/, "").trim();
+    if (party.length > 50) {
+      party = party.substring(0, 50) + "...";
+    }
+    if (!party || party === "...") party = "M-Pesa Transaction";
+
+    // Auto-categorize common keywords in party name
+    const pLower = party.toLowerCase();
+    if (pLower.includes("mama") || pLower.includes("grocery") || pLower.includes("butcher") || pLower.includes("food") || pLower.includes("fast food") || pLower.includes("restaurant") || pLower.includes("kfc") || pLower.includes("cafe")) {
+      category = "Food";
+    } else if (pLower.includes("cab") || pLower.includes("uber") || pLower.includes("bolt") || pLower.includes("petrol") || pLower.includes("shell") || pLower.includes("matatu") || pLower.includes("fuel") || pLower.includes("filling station")) {
+      category = "Transport";
+    } else if (pLower.includes("hospital") || pLower.includes("chemist") || pLower.includes("pharmacy") || pLower.includes("clinic") || pLower.includes("medical")) {
+      category = "Health";
+    } else if (pLower.includes("school") || pLower.includes("uni") || pLower.includes("academy") || pLower.includes("college") || pLower.includes("fees")) {
+      category = "Education";
+    } else if (pLower.includes("rent") || pLower.includes("landlord") || pLower.includes("kplc") || pLower.includes("electricity") || pLower.includes("water") || pLower.includes("zuku") || pLower.includes("dstv") || pLower.includes("safaricom home")) {
+      category = "Utilities";
+    } else if (pLower.includes("bar") || pLower.includes("lounge") || pLower.includes("club") || pLower.includes("cinema") || pLower.includes("hotel") || pLower.includes("leisure") || pLower.includes("resort")) {
+      category = "Leisure";
+    }
+
+    transactions.push({
+      id,
+      rawSms: `Extracted Row [ID: ${id}]`,
+      amount,
+      fee: 0,
+      type,
+      party,
+      dateTime: dateTimeStr,
+      balance,
+      category
+    });
+  }
+
+  // Sort transactions by date (descending)
+  return transactions.sort((a, b) => new Date(b.dateTime).getTime() - new Date(a.dateTime).getTime());
+}
+
 // Highly robust Regex Parser as a solid fallback or local processor
 function parseMpesaSmsRegex(text: string): MpesaTransaction[] {
-  // Split into individual messages. Can start with a 10-char alphanumeric or 8-12 char transaction code
-  const lines = text.split(/(?=\b[A-Z0-9]{8,12}\b)/g);
+  // If the text looks like an M-Pesa PDF/CSV statement, route to the dedicated PDF line parser
+  const lowerText = text.toLowerCase();
+  if (
+    lowerText.includes("receipt no") || 
+    lowerText.includes("paid in") || 
+    lowerText.includes("paid out") || 
+    lowerText.includes("completion time") || 
+    lowerText.includes("balance") || 
+    lowerText.includes("safaricom") ||
+    lowerText.includes("m-pesa statement") ||
+    lowerText.includes("detailed transaction")
+  ) {
+    console.info("Detected PDF/CSV statement structure. Routing to parseMpesaPdfText...");
+    return parseMpesaPdfText(text);
+  }
+
+  // Split into individual messages by line breaks first to avoid splitting on 8-12 char merchant names like QUICKMART (9) or ENTERPRISES (11)
+  let lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  
+  // If there are very few lines but the text is long, they might have pasted multiple SMSs in a continuous block without line breaks.
+  // In this fallback, split ONLY on transaction IDs followed by known transaction actions to prevent false-splitting on company names!
+  if (lines.length <= 2 && text.length > 100) {
+    lines = text.split(/(?=\b[A-Z0-9]{8,12}\b\s+(?:Confirmed|Paid|Received|You\s+have))/i).map(l => l.trim()).filter(Boolean);
+  }
+
   const transactions: MpesaTransaction[] = [];
 
   for (let raw of lines) {
@@ -204,7 +408,7 @@ function parseMpesaSmsRegex(text: string): MpesaTransaction[] {
 // 1. Analyze SMS API Route
 app.post("/api/analyze-sms", async (req, res) => {
   let extractedPdfText = "";
-  const { text, fileData, mimeType } = req.body;
+  const { text, fileData, mimeType, pdfPassword } = req.body;
   
   try {
     if (!fileData && (!text || typeof text !== "string")) {
@@ -214,17 +418,29 @@ app.post("/api/analyze-sms", async (req, res) => {
     // Decode and extract PDF text locally first if it is a PDF
     if (fileData && mimeType === "application/pdf") {
       try {
-        console.log("Decoding PDF and extracting text locally with pdf-parse...");
+        console.log("Decoding PDF and extracting text locally with PDFParse...");
         let base64Data = fileData;
         if (base64Data.includes(";base64,")) {
           base64Data = base64Data.split(";base64,").pop() || "";
         }
         const pdfBuffer = Buffer.from(base64Data, "base64");
-        const parsedPdf = await pdf(pdfBuffer);
-        extractedPdfText = parsedPdf.text || "";
+        
+        // Instantiate the modern PDFParse class with password parameters if available
+        const parser = new PDFParse({ data: pdfBuffer, password: pdfPassword || undefined });
+        const textResult = await parser.getText();
+        extractedPdfText = textResult.text || "";
         console.log(`Extracted ${extractedPdfText.length} characters from PDF.`);
       } catch (pdfErr: any) {
         console.error("Local PDF extraction failed:", pdfErr.message);
+        const errLower = pdfErr.message ? pdfErr.message.toLowerCase() : "";
+        if (pdfErr.name === "PasswordException" || errLower.includes("password") || errLower.includes("decrypt")) {
+          return res.status(400).json({ 
+            error: "This PDF statement is password-protected. Please provide your correct 6-digit statement passcode in the passcode field and try again." 
+          });
+        }
+        return res.status(400).json({
+          error: `Could not read PDF statement: ${pdfErr.message}. If the PDF is password-protected, please verify your passcode and try again.`
+        });
       }
     }
 
@@ -232,12 +448,13 @@ app.post("/api/analyze-sms", async (req, res) => {
     const ai = getAiClient();
     if (!ai) {
       if (mimeType === "application/pdf") {
-        console.log("Bypassing Gemini (Disabled or missing key). Running local regex parser on extracted PDF text.");
-        const transactions = parseMpesaSmsRegex(extractedPdfText);
+        console.log("Bypassing Gemini (Disabled or missing key). Running local PDF parser on extracted PDF text.");
+        const transactions = parseMpesaPdfText(extractedPdfText);
         return res.json({
           source: "local_pdf_parser",
           transactions,
           failedCount: 0,
+          extractedText: extractedPdfText,
         });
       }
       console.log("Using Regex parser fallback (No GEMINI_API_KEY configured)");
@@ -246,6 +463,7 @@ app.post("/api/analyze-sms", async (req, res) => {
         source: "regex_parser",
         transactions,
         failedCount: 0,
+        extractedText: text || "",
       });
     }
 
@@ -323,6 +541,7 @@ Respond with nothing but a valid JSON array. Ensure no markdown wrappers or back
       source: "gemini_api",
       transactions: enrichedTransactions,
       failedCount: 0,
+      extractedText: textContext,
     });
 
   } catch (error: any) {
@@ -337,10 +556,12 @@ Respond with nothing but a valid JSON array. Ensure no markdown wrappers or back
     try {
       const sourceText = mimeType === "application/pdf" ? extractedPdfText : (text || "");
       console.info("Using robust offline Regex parser fallback.");
-      const transactions = parseMpesaSmsRegex(sourceText);
+      const transactions = mimeType === "application/pdf" ? parseMpesaPdfText(extractedPdfText) : parseMpesaSmsRegex(sourceText);
       return res.json({
         source: mimeType === "application/pdf" ? "local_pdf_parser_fallback" : "regex_parser_fallback",
         transactions,
+        failedCount: 0,
+        extractedText: sourceText,
         info: "Running in offline fallback mode",
         warning: `Gemini API returned an error, so we parsed your statement using our robust local offline parser. (Error: ${errMsg})`
       });
@@ -349,6 +570,8 @@ Respond with nothing but a valid JSON array. Ensure no markdown wrappers or back
       return res.status(200).json({
         source: "regex_parser_fallback",
         transactions: [],
+        failedCount: 0,
+        extractedText: mimeType === "application/pdf" ? extractedPdfText : (text || ""),
         info: "Empty results",
       });
     }

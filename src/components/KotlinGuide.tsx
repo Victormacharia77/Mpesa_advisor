@@ -19,7 +19,10 @@ import {
   ListFilter,
   CheckCircle2,
   ChevronRight,
-  Info
+  Info,
+  Search,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { MpesaTransaction, TransactionType } from "../types";
 
@@ -33,6 +36,7 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
   // Test Parser State
   const [inputText, setInputText] = useState("");
   const [selectedFile, setSelectedFile] = useState<{ name: string; size: number; type: string; base64: string } | null>(null);
+  const [pdfPassword, setPdfPassword] = useState("");
   const [isParsing, setIsParsing] = useState(false);
   const [parsedTxs, setParsedTxs] = useState<MpesaTransaction[]>([]);
   const [parsedSource, setParsedSource] = useState<string>("");
@@ -40,6 +44,12 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedText, setCopiedText] = useState<string | null>(null);
+
+  // Advanced search & raw content inspection states
+  const [extractedText, setExtractedText] = useState<string>("");
+  const [searchExtractedQuery, setSearchExtractedQuery] = useState<string>("");
+  const [searchParsedQuery, setSearchParsedQuery] = useState<string>("");
+  const [showRawText, setShowRawText] = useState<boolean>(false);
 
   const handleCopy = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
@@ -93,7 +103,8 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
           };
           setSelectedFile(fileObj);
           setInputText(""); // Avoid putting binary string into textbox
-          triggerParse("", fileObj);
+          setPdfPassword(""); // Reset password field for new file
+          setSuccessMsg("PDF Statement loaded. Please enter your passcode below and click Parse Statement.");
         } else {
           setInputText(result);
           const fileObj = {
@@ -127,6 +138,7 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
     setError(null);
     setSuccessMsg(null);
     setParsedTxs([]);
+    setExtractedText("");
 
     try {
       const response = await fetch("/api/analyze-sms", {
@@ -135,7 +147,8 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
         body: JSON.stringify({ 
           text: textToParse,
           fileData: fileObj ? fileObj.base64 : undefined,
-          mimeType: fileObj ? fileObj.type : undefined
+          mimeType: fileObj ? fileObj.type : undefined,
+          pdfPassword: pdfPassword || undefined
         }),
       });
 
@@ -148,6 +161,12 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
       if (data.transactions && Array.isArray(data.transactions)) {
         setParsedTxs(data.transactions);
         setParsedSource(data.source === "gemini_api" ? "Gemini AI Core" : "Local Offline Pattern Recognizer");
+        
+        if (data.extractedText) {
+          setExtractedText(data.extractedText);
+        } else {
+          setExtractedText(textToParse);
+        }
         
         if (data.transactions.length === 0) {
           setError("No valid M-Pesa transaction patterns detected in the provided content. Please verify your statement format.");
@@ -176,9 +195,63 @@ export default function KotlinGuide({ onAddTransactions }: KotlinGuideProps) {
     }
   };
 
+  const handleDownloadCSV = () => {
+    if (parsedTxs.length === 0) return;
+    
+    // Header line
+    const headers = ["ID", "DateTime", "Type", "Party", "Amount", "Fee", "Balance", "Category"];
+    
+    // Format rows safely handling commas in descriptions/names
+    const rows = parsedTxs.map(tx => [
+      tx.id,
+      tx.dateTime,
+      `"${(tx.type || "").replace(/"/g, '""')}"`,
+      `"${(tx.party || "").replace(/"/g, '""')}"`,
+      tx.amount,
+      tx.fee,
+      tx.balance,
+      `"${(tx.category || "").replace(/"/g, '""')}"`
+    ]);
+    
+    // Combine into CSV string
+    const csvContent = [
+      headers.join(","),
+      ...rows.map(row => row.join(","))
+    ].join("\n");
+    
+    // Create download link
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `mpesa_statement_export_${new Date().toISOString().slice(0,10)}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    setSuccessMsg("Successfully exported your transactions to CSV!");
+  };
+
   const sampleLogs = `QX728HJ189 Confirmed. Ksh3,500.00 sent to MAMA MBOGA GROCERS on 15/7/26 at 11:15 AM. New M-PESA balance is Ksh14,200.00. Transaction cost, Ksh34.00.
 QJB49204 Confirmed. Ksh12,000.00 received from KEBASO ENTERPRISES on 14/7/26 at 3:30 PM. New M-PESA balance is Ksh17,734.00. Transaction cost, Ksh0.00.
 QJS91823 Confirmed. Paid Ksh1,200.00 to QUICKMART SUPERMARKET on 13/7/26 at 7:45 PM. New M-PESA balance is Ksh5,734.00. Transaction cost, Ksh0.00.`;
+
+  const filteredParsedTxs = parsedTxs.filter(tx => {
+    const q = searchParsedQuery.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      (tx.party || "").toLowerCase().includes(q) ||
+      (tx.id || "").toLowerCase().includes(q) ||
+      (tx.type || "").toLowerCase().includes(q) ||
+      (tx.category || "").toLowerCase().includes(q) ||
+      String(tx.amount).includes(q)
+    );
+  });
+
+  const escapeRegExp = (str: string) => {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  };
 
   return (
     <div className="flex flex-col h-full bg-[#0A0A0C] text-slate-100 overflow-y-auto">
@@ -383,6 +456,7 @@ QJS91823 Confirmed. Paid Ksh1,200.00 to QUICKMART SUPERMARKET on 13/7/26 at 7:45
                         e.preventDefault();
                         setSelectedFile(null);
                         setInputText("");
+                        setPdfPassword("");
                       }}
                       className="text-slate-400 hover:text-rose-400 text-xs p-1 rounded-lg transition cursor-pointer"
                       title="Clear Selection"
@@ -405,6 +479,27 @@ QJS91823 Confirmed. Paid Ksh1,200.00 to QUICKMART SUPERMARKET on 13/7/26 at 7:45
                   </label>
                 )}
               </div>
+
+              {selectedFile && selectedFile.type === "application/pdf" && (
+                <div className="mt-3 bg-[#121216] border border-amber-500/20 rounded-xl p-3 text-left">
+                  <div className="flex items-center gap-1.5 mb-1.5 text-amber-400">
+                    <span className="text-xs">🔒</span>
+                    <h4 className="text-xs font-black uppercase tracking-wider">Password-Protected PDF Statement</h4>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-relaxed mb-2.5">
+                    Safaricom M-Pesa PDF statements are encrypted with a <strong>6-digit passcode</strong>. Please enter your correct 6-digit passcode below to decrypt and parse it:
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      placeholder="Enter 6-Digit Passcode"
+                      value={pdfPassword}
+                      onChange={(e) => setPdfPassword(e.target.value)}
+                      className="flex-1 bg-black border border-amber-500/30 focus:border-amber-500/60 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 placeholder-slate-600 outline-none font-mono text-center tracking-widest"
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Or Divider */}
               <div className="flex items-center gap-2 my-3">
@@ -478,7 +573,7 @@ QJS91823 Confirmed. Paid Ksh1,200.00 to QUICKMART SUPERMARKET on 13/7/26 at 7:45
             {/* Parsed Result Display Panel */}
             {parsedTxs.length > 0 && (
               <div className="bg-[#121216] border border-white/5 rounded-2xl p-4 space-y-3.5">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div>
                     <h4 className="text-xs font-black text-white uppercase tracking-wider">
                       Successfully Extracted ({parsedTxs.length})
@@ -488,45 +583,153 @@ QJS91823 Confirmed. Paid Ksh1,200.00 to QUICKMART SUPERMARKET on 13/7/26 at 7:45
                     </span>
                   </div>
                   
-                  <button
-                    onClick={handleCommitTransactions}
-                    className="bg-[#00B140] hover:bg-[#009a37] text-slate-950 font-black text-[10px] px-3 py-1.5 rounded-lg transition active:scale-[0.97] flex items-center gap-1.5"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Merge to My Ledger</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleDownloadCSV}
+                      className="bg-[#1D1D22] border border-white/10 hover:bg-slate-800 text-slate-300 font-bold text-[10px] px-3 py-1.5 rounded-lg transition active:scale-[0.97] flex items-center gap-1.5 cursor-pointer"
+                      title="Download extracted transactions as a CSV file"
+                    >
+                      <Download className="w-3.5 h-3.5 text-[#00B140]" />
+                      <span>Download CSV</span>
+                    </button>
+                    
+                    <button
+                      onClick={handleCommitTransactions}
+                      className="bg-[#00B140] hover:bg-[#009a37] text-slate-950 font-black text-[10px] px-3 py-1.5 rounded-lg transition active:scale-[0.97] flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Merge to My Ledger</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Search Bar for Parsed Transactions */}
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                    <Search className="h-3.5 w-3.5 text-slate-500" />
+                  </span>
+                  <input
+                    type="text"
+                    value={searchParsedQuery}
+                    onChange={(e) => setSearchParsedQuery(e.target.value)}
+                    placeholder="Filter parsed transactions (e.g., John, Quickmart, Buy Goods, QX728)..."
+                    className="w-full bg-black border border-white/5 focus:border-[#00B140]/40 rounded-xl pl-9 pr-3 py-1.5 text-xs text-slate-100 placeholder-slate-600 outline-none"
+                  />
+                  {searchParsedQuery && (
+                    <button
+                      onClick={() => setSearchParsedQuery("")}
+                      className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-500 hover:text-slate-300 text-xs cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  )}
                 </div>
 
                 {/* Scroller list of parsed txs */}
                 <div className="space-y-1.5 max-h-[220px] overflow-y-auto pr-1">
-                  {parsedTxs.map((tx, idx) => (
-                    <div key={idx} className="bg-black/40 border border-white/5 rounded-xl p-2.5 text-[11px] flex justify-between items-center gap-2">
-                      <div className="overflow-hidden">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-bold text-white truncate max-w-[120px]">
-                            {tx.party}
+                  {filteredParsedTxs.length > 0 ? (
+                    filteredParsedTxs.map((tx, idx) => (
+                      <div key={idx} className="bg-black/40 border border-white/5 rounded-xl p-2.5 text-[11px] flex justify-between items-center gap-2">
+                        <div className="overflow-hidden">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-bold text-white truncate max-w-[120px]">
+                              {tx.party}
+                            </span>
+                            <span className="text-[8px] px-1 py-0.2 bg-[#1D1D22] text-slate-400 rounded font-mono font-bold">
+                              {tx.id}
+                            </span>
+                          </div>
+                          <div className="text-[9px] text-slate-500 mt-0.5 flex gap-1 items-center">
+                            <span>{tx.type}</span>
+                            <span>•</span>
+                            <span>{tx.category}</span>
+                          </div>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <span className="font-mono text-white font-black block">
+                            Ksh {tx.amount.toLocaleString()}
                           </span>
-                          <span className="text-[8px] px-1 py-0.2 bg-[#1D1D22] text-slate-400 rounded font-mono font-bold">
-                            {tx.id}
+                          <span className="text-[8.5px] text-slate-500 block">
+                            Fee: Ksh {tx.fee}
                           </span>
                         </div>
-                        <div className="text-[9px] text-slate-500 mt-0.5 flex gap-1 items-center">
-                          <span>{tx.type}</span>
-                          <span>•</span>
-                          <span>{tx.category}</span>
-                        </div>
                       </div>
-                      <div className="text-right shrink-0">
-                        <span className="font-mono text-white font-black block">
-                          Ksh {tx.amount.toLocaleString()}
-                        </span>
-                        <span className="text-[8.5px] text-slate-500 block">
-                          Fee: Ksh {tx.fee}
-                        </span>
-                      </div>
+                    ))
+                  ) : (
+                    <div className="text-center py-6 text-slate-500 text-xs">
+                      No parsed transactions match your search query.
                     </div>
-                  ))}
+                  )}
                 </div>
+              </div>
+            )}
+
+            {/* Inspect Raw Extracted PDF/SMS Text */}
+            {extractedText && (
+              <div className="bg-[#121216] border border-white/5 rounded-2xl p-4 space-y-3">
+                <button
+                  onClick={() => setShowRawText(!showRawText)}
+                  className="w-full flex items-center justify-between text-xs font-black text-slate-300 uppercase tracking-wider hover:text-white transition cursor-pointer"
+                >
+                  <div className="flex items-center gap-1.5">
+                    {showRawText ? <EyeOff className="w-4 h-4 text-[#00B140]" /> : <Eye className="w-4 h-4 text-[#00B140]" />}
+                    <span>{showRawText ? "Hide Raw Statement Contents" : "Inspect Raw Statement Contents"}</span>
+                  </div>
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    {extractedText.length.toLocaleString()} chars
+                  </span>
+                </button>
+
+                {showRawText && (
+                  <div className="space-y-2 pt-1.5 border-t border-white/5">
+                    <p className="text-[10.5px] text-slate-400 leading-relaxed">
+                      Below is the raw decrypted text extracted from your statement. Use the search bar to locate specific receipt details, references, or text content:
+                    </p>
+                    
+                    {/* Search Bar for Raw Text */}
+                    <div className="relative">
+                      <span className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
+                        <Search className="h-3.5 w-3.5 text-slate-500" />
+                      </span>
+                      <input
+                        type="text"
+                        value={searchExtractedQuery}
+                        onChange={(e) => setSearchExtractedQuery(e.target.value)}
+                        placeholder="Search keywords or receipt codes in raw text..."
+                        className="w-full bg-black border border-white/5 focus:border-[#00B140]/40 rounded-xl pl-9 pr-3 py-1.5 text-xs text-slate-100 placeholder-slate-600 outline-none"
+                      />
+                      {searchExtractedQuery && (
+                        <button
+                          onClick={() => setSearchExtractedQuery("")}
+                          className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-500 hover:text-slate-300 text-xs cursor-pointer"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Raw Text Display Container with highlights */}
+                    <div className="bg-black/60 border border-white/5 rounded-xl p-3 max-h-[220px] overflow-y-auto font-mono text-[9.5px] leading-relaxed text-slate-400 whitespace-pre-wrap select-text selection:bg-[#00B140]/30">
+                      {searchExtractedQuery.trim() ? (
+                        (() => {
+                          const query = searchExtractedQuery.trim().toLowerCase();
+                          const parts = extractedText.split(new RegExp(`(${escapeRegExp(searchExtractedQuery)})`, "gi"));
+                          return parts.map((part, index) => 
+                            part.toLowerCase() === query ? (
+                              <mark key={index} className="bg-[#00B140]/30 text-[#00B140] px-0.5 rounded font-black">
+                                {part}
+                              </mark>
+                            ) : (
+                              part
+                            )
+                          );
+                        })()
+                      ) : (
+                        extractedText
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
