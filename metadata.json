@@ -1,0 +1,6 @@
+{
+  "name": "M-Pesa Message Analyzer",
+  "description": "A high-fidelity mobile-style web application that parses and analyzes M-Pesa SMS messages using Gemini AI, generating spending charts, cost trends, and detailed monthly reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
